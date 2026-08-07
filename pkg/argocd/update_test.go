@@ -1589,10 +1589,13 @@ registries:
 	})
 
 	t.Run("Test skip when force-update image has no live tag and registry returns empty tags (issue #1218)", func(t *testing.T) {
+		tagCalls := 0
 		mockClientFn := func(endpoint *registry.RegistryEndpoint, username, password string) (registry.RegistryClient, error) {
 			regMock := regmock.RegistryClient{}
 			regMock.On("NewRepository", mock.Anything, mock.Anything).Return(nil)
-			regMock.On("Tags", mock.Anything).Return([]string{}, nil)
+			regMock.On("Tags", mock.Anything).
+				Run(func(mock.Arguments) { tagCalls++ }).
+				Return([]string{}, nil)
 			return &regMock, nil
 		}
 
@@ -1651,6 +1654,7 @@ registries:
 		assert.Equal(t, 0, res.NumImagesUpdated)
 		// No blank-tag image parameter should be written to the application spec.
 		assert.Empty(t, appImages.Application.Spec.Source.Kustomize.Images)
+		assert.Equal(t, 1, tagCalls)
 	})
 
 	t.Run("Test error on improper semver in tag", func(t *testing.T) {

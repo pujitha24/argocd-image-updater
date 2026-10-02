@@ -528,6 +528,96 @@ func TestRoundTrip_Failure(t *testing.T) {
 	assert.Nil(t, actualResp)
 }
 
+// A throttled page in the middle of a paginated tag listing must be retried
+// instead of failing the whole listing.
+func TestTags_RetriesTooManyRequestsDuringPagination(t *testing.T) {
+	var page2Calls int
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/":
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Query().Get("last") == "b":
+			page2Calls++
+			if page2Calls == 1 {
+				w.Header().Set("Retry-After", "0")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			_, _ = w.Write([]byte(`{"name":"foo","tags":["c"]}`))
+		default:
+			w.Header().Set("Link", `<`+srv.URL+`/v2/foo/tags/list?last=b&n=2>; rel="next"`)
+			_, _ = w.Write([]byte(`{"name":"foo","tags":["a","b"]}`))
+		}
+	}))
+	defer srv.Close()
+
+	ep := &RegistryEndpoint{RegistryAPI: srv.URL, Limiter: ratelimit.NewUnlimited()}
+	clt, err := NewClient(ep, "", "")
+	require.NoError(t, err)
+	require.NoError(t, clt.NewRepository(context.Background(), "foo"))
+
+	tags, err := clt.Tags(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, tags)
+	assert.Equal(t, 2, page2Calls)
+}
+
+func TestRoundTrip_TooManyRequests(t *testing.T) {
+	newReq := func() *http.Request {
+		return httptest.NewRequest("GET", "http://example.com", nil)
+	}
+	throttled := func(retryAfter string) *http.Response {
+		h := http.Header{}
+		if retryAfter != "" {
+			h.Set("Retry-After", retryAfter)
+		}
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: http.NoBody}
+	}
+	setup := func() (*rateLimitTransport, *mocks.RoundTripper) {
+		l := new(mocks.Limiter)
+		l.On("Take").Return(time.Now())
+		rt := new(mocks.RoundTripper)
+		return &rateLimitTransport{limiter: l, transport: rt}, rt
+	}
+
+	t.Run("gives up after bounded retries", func(t *testing.T) {
+		rlt, rt := setup()
+		rt.On("RoundTrip", mock.Anything).Return(throttled("0"), nil)
+		resp, err := rlt.RoundTrip(newReq())
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		rt.AssertNumberOfCalls(t, "RoundTrip", maxTooManyRequestsRetries+1)
+	})
+
+	t.Run("does not wait beyond the cap", func(t *testing.T) {
+		rlt, rt := setup()
+		rt.On("RoundTrip", mock.Anything).Return(throttled("3600"), nil)
+		resp, err := rlt.RoundTrip(newReq())
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		rt.AssertNumberOfCalls(t, "RoundTrip", 1)
+	})
+
+	t.Run("does not retry non-idempotent requests", func(t *testing.T) {
+		rlt, rt := setup()
+		rt.On("RoundTrip", mock.Anything).Return(throttled("0"), nil)
+		resp, err := rlt.RoundTrip(httptest.NewRequest("POST", "http://example.com", nil))
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+		rt.AssertNumberOfCalls(t, "RoundTrip", 1)
+	})
+
+	t.Run("stops waiting when the context is cancelled", func(t *testing.T) {
+		rlt, rt := setup()
+		rt.On("RoundTrip", mock.Anything).Return(throttled("10"), nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := rlt.RoundTrip(newReq().WithContext(ctx))
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
 func TestRefreshToken(t *testing.T) {
 	creds := credentials{
 		refreshTokens: map[string]string{

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -114,14 +115,57 @@ type rateLimitTransport struct {
 	endpoint  *RegistryEndpoint
 }
 
-// RoundTrip is a custom RoundTrip method with rate-limiter
+const (
+	// maxTooManyRequestsRetries is how often a throttled (HTTP 429) request is
+	// retried before the 429 response is handed back to the caller.
+	maxTooManyRequestsRetries = 3
+	// maxRetryAfter caps how long a Retry-After is honoured. A longer wait is
+	// not retried at all.
+	maxRetryAfter = 30 * time.Second
+	// defaultRetryAfter is used when a 429 carries no usable Retry-After.
+	defaultRetryAfter = time.Second
+)
+
+// retryAfter returns how long a 429 response asks the client to wait.
+func retryAfter(resp *http.Response) time.Duration {
+	v := resp.Header.Get("Retry-After")
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return max(time.Until(t), 0)
+	}
+	return defaultRetryAfter
+}
+
+// RoundTrip is a custom RoundTrip method with rate-limiter. Throttled (HTTP
+// 429) GET and HEAD requests are retried a few times, honouring Retry-After,
+// so that one throttled page does not discard an entire paginated tag list.
 func (rlt *rateLimitTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	logCtx := log.LoggerFromContext(r.Context())
 
-	rlt.limiter.Take()
-	logCtx.Tracef("Performing HTTP %s %s", r.Method, r.URL)
-	resp, err := rlt.transport.RoundTrip(r)
-	return resp, err
+	for attempt := 0; ; attempt++ {
+		rlt.limiter.Take()
+		logCtx.Tracef("Performing HTTP %s %s", r.Method, r.URL)
+		resp, err := rlt.transport.RoundTrip(r)
+		if err != nil || resp.StatusCode != http.StatusTooManyRequests ||
+			(r.Method != http.MethodGet && r.Method != http.MethodHead) ||
+			attempt >= maxTooManyRequestsRetries {
+			return resp, err
+		}
+		wait := retryAfter(resp)
+		if wait > maxRetryAfter {
+			return resp, nil
+		}
+		logCtx.Debugf("Registry throttled %s %s (HTTP 429), retrying in %s", r.Method, r.URL, wait)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		select {
+		case <-time.After(wait):
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}
 }
 
 // challengeRetryTransport learns authentication challenges from real
